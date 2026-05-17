@@ -91,8 +91,14 @@ async function startSession(workspaceId) {
   sock.ev.on('messages.upsert', async ({ messages }) => {
     for (const msg of messages) {
       if (msg.key.fromMe) continue;
-      const hasMedia = msg.message?.imageMessage || msg.message?.documentMessage ||
-        msg.message?.videoMessage || msg.message?.audioMessage;
+      // Unwrap viewOnce and captioned messages
+      const innerMsg = msg.message?.viewOnceMessage?.message || 
+        msg.message?.viewOnceMessageV2?.message ||
+        msg.message?.documentWithCaptionMessage?.message || 
+        msg.message || {};
+      // Allow images and all documents (no videos/audio)
+      const hasMedia = innerMsg.imageMessage || innerMsg.documentMessage ||
+        msg.message?.documentWithCaptionMessage?.message?.documentMessage;
       if (!hasMedia) continue;
 
       const phone = msg.key.remoteJid?.replace('@s.whatsapp.net', '') || 'unknown';
@@ -105,8 +111,12 @@ async function startSession(workspaceId) {
         const ext = getExtFromMsg(msg);
         const fileName = `${phone}_${Date.now()}_file.${ext}`;
 
+        // Get sender's profile pic
+        let profilePicUrl = null;
+        try { profilePicUrl = await sock.profilePictureUrl(msg.key.remoteJid, 'image'); } catch {}
+
         // Upload to parent
-        await uploadToParent(workspaceId, buffer, fileName, phone, pushName);
+        await uploadToParent(workspaceId, buffer, fileName, phone, pushName, profilePicUrl);
         console.log(`[WA:${workspaceId.slice(0,8)}] Uploaded ${fileName} from ${pushName}`);
       } catch (e) {
         console.error(`[WA:${workspaceId.slice(0,8)}] Media error:`, e.message);
@@ -138,72 +148,53 @@ async function downloadMedia(sock, msg) {
 }
 
 function getExtFromMsg(msg) {
-  if (msg.message?.imageMessage) return 'jpg';
-  if (msg.message?.videoMessage) return 'mp4';
-  if (msg.message?.audioMessage) return 'ogg';
-  if (msg.message?.documentMessage) {
-    const name = msg.message.documentMessage.fileName || '';
+  const m = msg.message?.viewOnceMessage?.message || 
+    msg.message?.viewOnceMessageV2?.message ||
+    msg.message?.documentWithCaptionMessage?.message || 
+    msg.message || {};
+  if (m.imageMessage) return 'jpg';
+  if (m.videoMessage) return 'mp4';
+  if (m.audioMessage) return 'ogg';
+  if (m.documentMessage) {
+    const name = m.documentMessage.fileName || '';
     return name.split('.').pop() || 'pdf';
   }
   return 'bin';
 }
 
-async function uploadToParent(workspaceId, buffer, fileName, phone, pushName) {
-  const http = await import('http');
+async function uploadToParent(workspaceId, buffer, fileName, phone, pushName, profilePicUrl) {
+  const FormData = (await import('form-data')).default;
   const https = await import('https');
+  const http = await import('http');
   const url = new URL(`${PARENT_URL}/api/worker/upload`);
-  const boundary = '----CyberControl' + Date.now().toString(36);
   
-  const parts = [];
-  // file field
-  parts.push(`--${boundary}
-Content-Disposition: form-data; name="file"; filename="${fileName}"
-Content-Type: application/octet-stream
-
-`);
-  parts.push(buffer);
-  parts.push(`
-`);
-  // phone field
-  parts.push(`--${boundary}
-Content-Disposition: form-data; name="phone"
-
-${phone}
-`);
-  // senderName field
-  parts.push(`--${boundary}
-Content-Disposition: form-data; name="senderName"
-
-${pushName}
-`);
-  // workspaceId field
-  parts.push(`--${boundary}
-Content-Disposition: form-data; name="workspaceId"
-
-${workspaceId}
-`);
-  parts.push(`--${boundary}--
-`);
-  
-  const body = Buffer.concat(parts.map(p => typeof p === 'string' ? Buffer.from(p) : p));
+  const form = new FormData();
+  form.append('file', buffer, { filename: fileName, contentType: 'application/octet-stream' });
+  form.append('phone', phone);
+  form.append('senderName', pushName);
+  form.append('workspaceId', workspaceId);
+  form.append('fileName', fileName);
+  if (profilePicUrl) form.append('profilePicUrl', profilePicUrl);
   
   const mod = url.protocol === 'https:' ? https : http;
+  
   const res = await new Promise((resolve, reject) => {
     const req = mod.request({
-      hostname: url.hostname, port: url.port || (url.protocol === 'https:' ? 443 : 80),
-      path: url.pathname, method: 'POST',
-      headers: {
-        'Content-Type': `multipart/form-data; boundary=${boundary}`,
-        'Content-Length': body.length,
-        'x-worker-secret': SERVICE_SECRET,
-      }
-    }, (r) => { let d=''; r.on('data',c=>d+=c); r.on('end',()=>resolve({status:r.statusCode,body:d})); });
+      hostname: url.hostname,
+      port: url.port || (url.protocol === 'https:' ? 443 : 80),
+      path: url.pathname,
+      method: 'POST',
+      headers: { ...form.getHeaders(), 'x-worker-secret': SERVICE_SECRET },
+    }, (r) => {
+      let d = '';
+      r.on('data', c => d += c);
+      r.on('end', () => resolve({ status: r.statusCode, body: d }));
+    });
     req.on('error', reject);
-    req.write(body);
-    req.end();
+    form.pipe(req);
   });
   
-  if (res.status >= 400) throw new Error(`Upload failed: ${res.status} ${res.body.substring(0,100)}`);
+  if (res.status >= 400) throw new Error(`Upload failed: ${res.status} ${res.body.substring(0, 100)}`);
 }
 
 async function notifyParent(workspaceId, event, data) {
@@ -256,6 +247,18 @@ app.get('/sessions/:workspaceId/status', authMiddleware, (req, res) => {
 app.get('/sessions/:workspaceId/qr', authMiddleware, (req, res) => {
   const session = sessions.get(req.params.workspaceId);
   res.json({ qr: session?.qr || null });
+});
+
+app.post('/sessions/:workspaceId/send', authMiddleware, async (req, res) => {
+  const session = sessions.get(req.params.workspaceId);
+  if (!session?.socket) return res.status(400).json({ error: 'Not connected' });
+  const { phone, message } = req.body;
+  if (!phone || !message) return res.status(400).json({ error: 'phone and message required' });
+  try {
+    const jid = phone.replace(/[^0-9]/g, '') + '@s.whatsapp.net';
+    await session.socket.sendMessage(jid, { text: message });
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/sessions', authMiddleware, (_, res) => {
